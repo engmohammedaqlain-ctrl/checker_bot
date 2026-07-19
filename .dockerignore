@@ -1,0 +1,21 @@
+# الأسرار — لا تُنسخ داخل الصورة أبداً (المفاتيح تُضبط من لوحة Railway)
+.env
+
+# ملفات بايثون مؤقتة
+__pycache__/
+*.pyc
+*.pyo
+
+# بيئات افتراضية
+venv/
+.venv/
+
+# git
+.git/
+.gitignore
+
+# ملفات محلية غير لازمة للتشغيل
+test.pdf
+notes_prompt.docx
+~$*.docx
+*.md
