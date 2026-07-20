@@ -29,12 +29,13 @@ import asyncio
 import logging
 import tempfile
 import subprocess
+from urllib.parse import quote
 
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -134,7 +135,8 @@ CV_SYSTEM_PROMPT = """\
 - لو التاريخ مكتوب بالسنوات بس بدون شهور: احكيله تنسيق التاريخ لازم يكون بالشهر و السنة مش بس السنة.
 [الإنجازات]
 - تأكد إنو تحت كل خبرة في إنجاز أو رقم زي عالجت أكثر من 100 مريض. لو مش هيك احكيله قسم الخبرات مش مكتوب بالطريقة الصح لازم تحت كل خبرة أقل إشي تكتب إنجاز واحد حققتوا جوا هاي الخبرة و يفضّل يكون رقم. خُد أقوى نقطة واقعية عنده و اعطِ مثال بسيط مختصر: يعني شغلك في (اسم الشركة) بدل ما تكتب (النقطة الأصلية بعد ما تترجمها للعربي عامي مش بالإنجليزي) اكتبها بأرقام من شغلك مثل (جملة إنجاز قصيرة وحدة فيها رقم). ممنوع تنسخ نقطة الخبرة بالإنجليزي دايماً ترجمها للعربي العامي. خلي المثال قصير و بسيط جملة وحدة بس مش إعادة صياغة طويلة. ممنوع تضيف بالنهاية أي تنويه زي "الأرقام مثال و حط أرقامك الحقيقية" الجملة بتنتهي عند المثال مباشرة.
-- لو الخبرة أصلاً فيها إنجاز رقمي جيد: امدحيه بصيغة إنجاز حققه الشخص مش بصيغة "فيها رقم". قول "منيح إنك كاتب إنك أنجزت (الرقم و الإنجاز)" للذكر أو "منيح إنك كاتبة إنك أنجزتِ (الرقم و الإنجاز)" للأنثى. مثال: "منيح إنك كاتبة إنك أنجزتِ 50 ساعة تدريس". ممنوع تقول "الخبرة فيها رقم 50 ساعة".
+- لو الخبرة أصلاً فيها إنجاز رقمي جيد: امدحيه بصيغة إنجاز حققه الشخص مش بصيغة "فيها رقم". قول "منيح إنك كاتب إنك أنجزت (الرقم و الإنجاز)" للذكر أو "منيح إنك كاتبة إنك أنجزتي (الرقم و الإنجاز)" للأنثى. مثال: "منيح إنك كاتبة إنك أنجزتي 50 ساعة تدريس". ممنوع تقول "الخبرة فيها رقم 50 ساعة".
+- مهم: لو في أكتر من إنجاز رقمي منيح ادمجهم كلهم بجملة مدح وحدة بس. مثال "منيح إنك كاتبة إنك أنجزتي حوالي 100 نشاط توعية صحية بالأسبوع مع أطباء بلا حدود و أكتر من 450 استشارة رضاعة و ساعدتي بأكتر من 150 ولادة". ممنوع تكرر جملة "منيح إنك كاتبة" أكتر من مرة بالتقرير كله.
 
 التعليم:
 - تأكد إنو كاتب سنة التخرج بس مش فترة زمنية. لو كاتب فترة: احكيله بقسم التعليم الصح تكتب سنة التخرج بس بدل الفترة الزمنية.
@@ -146,7 +148,8 @@ CV_SYSTEM_PROMPT = """\
 - لو في تكرار بالمهارات (زي ذكر Microsoft Office ثم Word و Excel و PowerPoint كل واحد لحال): احكيله في تكرار و الصح تكتفي بذكر Microsoft Office مرة وحدة أو تفصّل البرامج بدون تكرار. ممنوع تستخدم كلمة "أجنحة" أو "جناح" كترجمة لـ Suite اكتب الاسم بالإنجليزي زي ما هو.
 
 الدورات و الشهادات:
-- لكل دورة ناقصة تفاصيل: احكيله عندك دورة (اسم الدورة) مش كاتب (شو الناقص بالضبط) و الصح كل دورة تذكر اسمها + الجهة المانحة يعني مكان الحصول عليها + تاريخ الإنجاز + عدد ساعات الدورة.
+- لأول دورة ناقصة تفاصيل: احكيله عندك دورة (اسم الدورة) مش كاتب (شو الناقص بالضبط) و الصح كل دورة تذكر اسمها + الجهة المانحة يعني مكان الحصول عليها + تاريخ الإنجاز + عدد ساعات الدورة.
+- مهم: لو في أكتر من دورة ناقصها نفس الإشي ادمجهم كلهم بملاحظة وحدة و اذكر أسماء الدورات مع بعض بالسطر نفسه. مثال "عندك كمان دورات (اسم و اسم و اسم) مش كاتب عدد ساعاتهم". ممنوع منعاً باتاً تكتب سطر منفصل لكل دورة بنفس النقص لأنو هادا تكرار ممل.
 - لو ترتيب الدورات عشوائي: احكيله رتّبهم بشكل أفضل.
 
 اللغات:
@@ -276,7 +279,61 @@ async def analyze_cv_with_ai(images: list[bytes]) -> str:
 # ---------------------------------------------------------------------------
 # منطق المعالجة المشترك
 # ---------------------------------------------------------------------------
-async def process_cv(context: ContextTypes.DEFAULT_TYPE, chat_id: int, images: list[bytes]):
+def normalize_phone(raw: str) -> str | None:
+    """ينظّف رقم الواتساب: يشيل المسافات و الشرطات و علامة + و الأقواس.
+
+    "+970 567 785 882" -> "970567785882"
+    "0567785882"       -> "970567785882"  (رقم محلي فلسطيني)
+    يعيد None إذا كان الرقم غير منطقي.
+    """
+    digits = re.sub(r"\D", "", raw or "")     # أرقام فقط
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("0"):
+        digits = "970" + digits[1:]
+    return digits if 9 <= len(digits) <= 15 else None
+
+
+async def send_whatsapp_button(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, phone: str, report: str
+):
+    """يرسل زر مشاركة الفحص مع العميل عبر واتساب.
+
+    يحاول تعبئة نص التقرير داخل الرابط. لو رفضه تيليجرام لطول الرابط
+    يرجع لزر يفتح محادثة العميل فقط.
+    """
+    base = f"https://wa.me/{phone}"
+
+    def kb(url: str):
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📤 مشاركة الفحص مع العميل", url=url)]]
+        )
+
+    try:
+        await context.bot.send_message(
+            chat_id,
+            "اضغط الزر لإرسال الفحص للعميل على واتساب 👇",
+            reply_markup=kb(f"{base}?text={quote(report)}"),
+        )
+    except Exception:
+        logger.warning("رابط واتساب طويل — إرسال زر بدون نص معبّأ")
+        try:
+            await context.bot.send_message(
+                chat_id,
+                "التقرير طويل فما قدرت أعبّيه جاهز بالرسالة.\n"
+                "اضغط الزر لفتح محادثة العميل ثم انسخ التقرير من فوق والصقه 👇",
+                reply_markup=kb(base),
+            )
+        except Exception:
+            logger.exception("تعذّر إرسال زر واتساب")
+
+
+async def process_cv(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    images: list[bytes],
+    phone: str | None = None,
+):
     """يستقبل قائمة صور جاهزة، يرسلها للموديل، ويعيد التقييم للمستخدم."""
     if not images:
         await context.bot.send_message(chat_id, "❌ لم أستطع قراءة أي صورة من الملف.")
@@ -299,6 +356,8 @@ async def process_cv(context: ContextTypes.DEFAULT_TYPE, chat_id: int, images: l
         # تيليجرام يحدّ الرسالة بـ 4096 حرفاً — نقسّم إن لزم.
         for chunk in _split_text(report, 4000):
             await context.bot.send_message(chat_id, chunk)
+        if phone:
+            await send_whatsapp_button(context, chat_id, phone, report)
     except Exception as e:
         logger.exception("خطأ أثناء فحص السيرة الذاتية")
         await status.edit_text(f"❌ حدث خطأ أثناء الفحص:\n{e}")
@@ -393,7 +452,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await process_cv(context, chat_id, images)
+    await ask_for_phone(context, chat_id, images)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -405,9 +464,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     mgid = msg.media_group_id
 
-    # صورة مفردة → معالجة فورية
+    # صورة مفردة → نطلب رقم العميل ثم نفحص
     if not mgid:
-        await process_cv(context, chat_id, [data])
+        await ask_for_phone(context, chat_id, [data])
         return
 
     # ألبوم → نجمّع الصور ثم نعالجها دفعة واحدة (debounce)
@@ -429,10 +488,37 @@ async def _flush_media_group(context: ContextTypes.DEFAULT_TYPE, mgid: str):
     groups = context.application.bot_data.get("media_groups", {})
     grp = groups.pop(mgid, None)
     if grp:
-        await process_cv(context, grp["chat_id"], grp["images"])
+        await ask_for_phone(context, grp["chat_id"], grp["images"])
+
+
+async def ask_for_phone(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, images: list[bytes]
+):
+    """يخزّن صور السيرة ويطلب رقم واتساب العميل قبل بدء الفحص."""
+    context.application.bot_data.setdefault("pending_cv", {})[chat_id] = images
+    await context.bot.send_message(
+        chat_id,
+        "📱 قبل ما أفحص السيرة ابعتلي رقم الواتس الخاص بالعميل\n\n"
+        "مثال: +970 567 785 882",
+    )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    pending = context.application.bot_data.setdefault("pending_cv", {})
+
+    # في سيرة منتظرة رقم العميل → هذه الرسالة هي الرقم
+    if chat_id in pending:
+        phone = normalize_phone(update.message.text)
+        if not phone:
+            await update.message.reply_text(
+                "❌ الرقم مش واضح. ابعت رقم واتساب صحيح\n\nمثال: +970 567 785 882"
+            )
+            return
+        images = pending.pop(chat_id)
+        await process_cv(context, chat_id, images, phone)
+        return
+
     await update.message.reply_text(
         "📄 أرسل لي سيرتك الذاتية (صورة / صور / PDF / Word) لأفحصها لك."
     )
