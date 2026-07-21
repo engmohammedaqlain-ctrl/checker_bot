@@ -40,6 +40,7 @@ from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -57,6 +58,10 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 XAI_API_KEY = os.environ.get("XAI_API_KEY")
 XAI_MODEL = os.environ.get("XAI_MODEL", "grok-4.5")
 XAI_BASE_URL = "https://api.x.ai/v1"
+
+# الجروب الذي تُنشر فيه نتائج الفحص بدل محادثة البوت.
+# ملاحظة: للسوبر جروب يكون المعرّف بصيغة -100xxxxxxxxxx — الكود يجرّب الصيغتين.
+REPORT_GROUP_ID = os.environ.get("REPORT_GROUP_ID", "-5541205051")
 
 ANALYSIS_DPI = 200      # دقة تحويل صفحات PDF/Word للصور المُرسَلة إلى الموديل.
 MAX_FILE_MB = 20        # أقصى حجم ملف مسموح به (حد تيليجرام للبوتات ~20MB).
@@ -294,38 +299,81 @@ def normalize_phone(raw: str) -> str | None:
     return digits if 9 <= len(digits) <= 15 else None
 
 
-async def send_whatsapp_button(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, phone: str, report: str
+async def resolve_group_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    """يحدّد صيغة معرّف الجروب الصحيحة (عادي أو سوبر جروب) ويخزّنها."""
+    cached = context.application.bot_data.get("group_id")
+    if cached:
+        return cached
+
+    raw = str(REPORT_GROUP_ID).strip()
+    digits = raw.lstrip("-")
+    candidates = [raw]
+    if not digits.startswith("100"):
+        candidates.append("-100" + digits)      # صيغة السوبر جروب
+
+    for cid in candidates:
+        try:
+            await context.bot.get_chat(int(cid))
+            context.application.bot_data["group_id"] = int(cid)
+            logger.info("معرّف الجروب الفعّال: %s", cid)
+            return int(cid)
+        except Exception:
+            continue
+
+    logger.error("تعذّر الوصول للجروب %s — تأكد أن البوت عضو فيه", raw)
+    return None
+
+
+async def send_status_message(
+    context: ContextTypes.DEFAULT_TYPE, group_id: int, phone: str, report: str
 ):
-    """يرسل زر مشاركة الفحص مع العميل عبر واتساب.
-
-    يحاول تعبئة نص التقرير داخل الرابط. لو رفضه تيليجرام لطول الرابط
-    يرجع لزر يفتح محادثة العميل فقط.
-    """
+    """يرسل رسالة الحالة مع زر المشاركة على واتساب وزر تأكيد الإرسال."""
     base = f"https://wa.me/{phone}"
+    confirm = InlineKeyboardButton("✅ تم الإرسال", callback_data=f"sent:{phone}")
 
-    def kb(url: str):
+    def markup(url: str):
         return InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📤 مشاركة الفحص مع العميل", url=url)]]
+            [[InlineKeyboardButton("📤 إرسال الفحص للعميل", url=url)], [confirm]]
         )
 
+    text = f"حالة الفحص: ⏳ بانتظار الإرسال\nرقم العميل: +{phone}"
     try:
         await context.bot.send_message(
-            chat_id,
-            "اضغط الزر لإرسال الفحص للعميل على واتساب 👇",
-            reply_markup=kb(f"{base}?text={quote(report)}"),
+            group_id, text, reply_markup=markup(f"{base}?text={quote(report)}")
         )
     except Exception:
-        logger.warning("رابط واتساب طويل — إرسال زر بدون نص معبّأ")
+        logger.warning("رابط واتساب طويل — زر بدون نص معبّأ")
         try:
             await context.bot.send_message(
-                chat_id,
-                "التقرير طويل فما قدرت أعبّيه جاهز بالرسالة.\n"
-                "اضغط الزر لفتح محادثة العميل ثم انسخ التقرير من فوق والصقه 👇",
-                reply_markup=kb(base),
+                group_id,
+                text + "\n\nالتقرير طويل فانسخه من فوق والصقه بعد فتح المحادثة",
+                reply_markup=markup(base),
             )
         except Exception:
-            logger.exception("تعذّر إرسال زر واتساب")
+            logger.exception("تعذّر إرسال رسالة الحالة")
+
+
+async def on_sent_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يبدّل حالة الفحص إلى (تم الإرسال) عند ضغط الزر."""
+    q = update.callback_query
+    await q.answer("تم تحديث الحالة ✅")
+
+    phone = q.data.split(":", 1)[1] if ":" in q.data else ""
+    who = q.from_user.first_name or "المستخدم"
+    kb = (
+        InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📤 فتح محادثة العميل", url=f"https://wa.me/{phone}")]]
+        )
+        if phone
+        else None
+    )
+    try:
+        await q.edit_message_text(
+            f"حالة الفحص: ✅ تم الإرسال\nرقم العميل: +{phone}\nأرسله: {who}",
+            reply_markup=kb,
+        )
+    except Exception:
+        logger.exception("تعذّر تحديث حالة الفحص")
 
 
 async def process_cv(
@@ -353,11 +401,22 @@ async def process_cv(
         report = await analyze_cv_with_ai(images)
         report = sanitize_report(report)
         await status.delete()
+
+        group_id = await resolve_group_id(context)
+        target = group_id or chat_id          # لو تعذّر الجروب نرجع لمحادثة البوت
+
         # تيليجرام يحدّ الرسالة بـ 4096 حرفاً — نقسّم إن لزم.
         for chunk in _split_text(report, 4000):
-            await context.bot.send_message(chat_id, chunk)
+            await context.bot.send_message(target, chunk)
         if phone:
-            await send_whatsapp_button(context, chat_id, phone, report)
+            await send_status_message(context, target, phone, report)
+
+        if group_id:
+            await context.bot.send_message(chat_id, "✅ تم إرسال نتيجة الفحص للجروب")
+        else:
+            await context.bot.send_message(
+                chat_id, "⚠️ تعذّر الوصول للجروب — عُرضت النتيجة هنا"
+            )
     except Exception as e:
         logger.exception("خطأ أثناء فحص السيرة الذاتية")
         await status.edit_text(f"❌ حدث خطأ أثناء الفحص:\n{e}")
@@ -498,8 +557,7 @@ async def ask_for_phone(
     context.application.bot_data.setdefault("pending_cv", {})[chat_id] = images
     await context.bot.send_message(
         chat_id,
-        "📱 قبل ما أفحص السيرة ابعتلي رقم الواتس الخاص بالعميل\n\n"
-        "مثال: +970 567 785 882",
+        "📱 قبل ما أفحص السيرة ابعتلي رقم الواتس الخاص بالعميل",
     )
 
 
@@ -538,6 +596,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(on_sent_clicked, pattern=r"^sent:"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
