@@ -16,5 +16,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # نسخ باقي الكود
 COPY . .
 
-# البوت يعمل بنظام long polling — لا يحتاج فتح منفذ
+# البوت يعمل بنظام long polling، والمنفذ للرابط الوسيط (تعليم حالة الإرسال)
+EXPOSE 8080
 CMD ["python", "main.py"]
